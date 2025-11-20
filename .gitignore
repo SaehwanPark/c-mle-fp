@@ -1,0 +1,58 @@
+# =============================================================================
+# .NET / F# Build Artifacts
+# =============================================================================
+[Bb]in/
+[Oo]bj/
+.config
+app.config
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+
+# =============================================================================
+# Dependencies (NuGet)
+# =============================================================================
+# Modern .NET Core / 5+ usually doesn't need this, but good for safety
+packages/
+*.nupkg
+# The 'project.lock.json' is the old style, 'project.assets.json' is new
+project.lock.json
+project.assets.json
+package-lock.json
+
+# =============================================================================
+# IDEs & Editors
+# =============================================================================
+# Visual Studio
+.vs/
+# VS Code
+.vscode/
+# JetBrains (Rider)
+.idea/
+*.sln.iml
+
+# =============================================================================
+# F# Specific
+# =============================================================================
+# F# interactive history (if any)
+.fsharp/
+
+# =============================================================================
+# OS Generated Files
+# =============================================================================
+.DS_Store
+Thumbs.db
+
+# =============================================================================
+# Machine Learning / Data
+# =============================================================================
+# Ignore large datasets or model dumps to prevent bloating the repo
+*.csv
+*.json
+*.tsv
+# Keep example data if specifically named, e.g., "example_data.csv"
+!example_data.csv
+
+# Jupyter Notebook checkpoints (if using .NET Interactive notebooks)
+.ipynb_checkpoints/
