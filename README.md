@@ -48,6 +48,7 @@ The main idea is:
 > **Fit your new model by maximizing likelihood, but subject to explicit population-level calibration constraints derived from a trusted base model.**
 
 We fit:
+
 $$
 g_\theta(X, Z) = P(Y = 1 \mid X, Z)
 $$
@@ -104,6 +105,7 @@ So:
 * This matches their breast-density modeling approach.
 
 This enables us to evaluate:
+
 $$
 \mathbb{E}_{Z \mid X} [ g_\theta(X, Z) ]
 $$
