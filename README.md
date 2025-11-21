@@ -222,5 +222,5 @@ type CalibrationTarget = {
 
 * Analytical gradients for likelihood terms
 * Support for alternative conditional models $f(Z \mid X)$
-* GPU acceleration of Monte Carlo calibration
+* Hardware acceleration
 * Comparison with post-hoc calibration methods (Platt scaling, isotonic regression)
