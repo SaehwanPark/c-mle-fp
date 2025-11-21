@@ -29,6 +29,7 @@ type Interval = {
   lower: float
   upper: float
 } with
+  /// Returns true if value is in the (lower, upper] bin.
   member this.contains(value: float) =
     value > this.lower && value <= this.upper
 
@@ -56,8 +57,11 @@ type CalibrationTarget = {
   intervals: Interval list
   expected_risks: float list
   tolerance: float
-  x_distribution: Map<float list, float>
+  /// Empirical or tabulated distribution over X in the target population.
+  /// Each entry is a pair of (X, weight).
+  x_distribution: (Vector<float> * float) list
 }
+
 
 // =============================================================================
 // LOGIC: Density & Math
@@ -70,39 +74,55 @@ module MathHelpers =
     1.0 / (1.0 + Math.Exp(-clipped))
 
   let log_pdf_truncated (density: ConditionalDensity) (z: float) (x: Vector<float>) =
-    let z_safe = Math.Max(z, 1e-10)
+    // Truncated log-normal: log Z ~ N(mu, sigma) truncated above at 0,
+    // so Z is supported on (0, 1]. This matches the setup in the cML paper.
+    let eps = 1e-10
+    let z_clamped = Math.Min(Math.Max(z, eps), 1.0 - eps)
 
     let x_aug =
       Seq.append [1.0] x
       |> Vector<float>.Build.DenseOfEnumerable
 
     let mu = density.tau_mean * x_aug
+    let log_z = Math.Log(z_clamped)
+    let norm_dist = Normal(mu, density.sigma)
 
-    let log_z = Math.Log(z_safe)
-    let a_std = -mu / density.sigma
+    // pdf(log Z) under N(mu, sigma)
+    let pdf_logz = norm_dist.Density(log_z)
+    // truncation at log Z <= 0 -> divide by P(log Z <= 0)
+    let cdf_upper = norm_dist.CumulativeDistribution(0.0)
 
-    try
-      let norm_dist = Normal(mu, density.sigma)
-      let pdf_val = norm_dist.Density(log_z)
-      let survival = 1.0 - Normal.CDF(0.0, 1.0, a_std)
-
-      Math.Log(pdf_val) - Math.Log(survival) - Math.Log(z_safe)
-    with _ ->
+    if cdf_upper <= 0.0 || Double.IsNaN(cdf_upper) || Double.IsNaN(pdf_logz) then
       -1e10
+    else
+      Math.Log(pdf_logz) - Math.Log(cdf_upper) - Math.Log(z_clamped)
 
   let sample_truncated (density: ConditionalDensity) (x: Vector<float>) (n_samples: int) (rng: Random) =
+    // Sample from the same truncated log-normal: log Z ~ N(mu, sigma), log Z <= 0.
     let x_aug =
       Seq.append [1.0] x
       |> Vector<float>.Build.DenseOfEnumerable
 
     let mu = density.tau_mean * x_aug
+    let norm_dist = Normal(mu, density.sigma, rng)
+
+    let rec sample_one attempts =
+      if attempts > 1000 then
+        // extremely unlikely if the truncation probability is reasonable,
+        // but guards against pathologies in optimization.
+        1e-10
+      else
+        let y = norm_dist.Sample()
+        if y <= 0.0 then
+          let z_val = Math.Exp(y)
+          Math.Max(1e-10, Math.Min(1.0 - 1e-10, z_val))
+        else
+          sample_one (attempts + 1)
 
     let samples =
-      Array.init n_samples (fun _ ->
-        let s = LogNormal.Sample(rng, mu, density.sigma)
-        Math.Max(1e-10, Math.Min(1e10, s))
-      )
+      Array.init n_samples (fun _ -> sample_one 0)
     Vector<float>.Build.Dense(samples)
+
 
 // =============================================================================
 // LOGIC: Parameter Conversion
@@ -111,20 +131,46 @@ module MathHelpers =
 module ParameterOps =
 
   let to_vector (p: Parameters) : Vector<float> =
+    let log_sigma = Math.Log(p.density.sigma)
     seq {
+      // logistic regression part
       yield p.beta_0
       yield! p.beta_x
       yield p.beta_z
+      // density part (tau_mean and log sigma)
+      yield! p.density.tau_mean
+      yield log_sigma
     }
     |> Vector<float>.Build.DenseOfEnumerable
 
-  let from_vector (v: Vector<float>) (n_feat_x: int) (density: ConditionalDensity) : Parameters =
+  let from_vector (v: Vector<float>) (n_feat_x: int) (n_tau: int) : Parameters =
+    // layout:
+    // [ beta_0
+    //   beta_x (n_feat_x)
+    //   beta_z
+    //   tau_mean (n_tau)
+    //   log_sigma ]
+    let idx_beta0 = 0
+    let idx_beta_x = 1
+    let idx_beta_z = idx_beta_x + n_feat_x
+    let idx_tau = idx_beta_z + 1
+    let idx_log_sigma = idx_tau + n_tau
+
+    let beta_0 = v.[idx_beta0]
+    let beta_x = v.SubVector(idx_beta_x, n_feat_x)
+    let beta_z = v.[idx_beta_z]
+
+    let tau_mean = v.SubVector(idx_tau, n_tau)
+    let log_sigma = v.[idx_log_sigma]
+    let sigma = Math.Exp(log_sigma) |> fun s -> Math.Max(s, 0.01)
+
     {
-      beta_0 = v.[0]
-      beta_x = v.SubVector(1, n_feat_x)
-      beta_z = v.[1 + n_feat_x]
-      density = density
+      beta_0 = beta_0
+      beta_x = beta_x
+      beta_z = beta_z
+      density = { tau_mean = tau_mean; sigma = sigma }
     }
+
 
 // =============================================================================
 // LOGIC: Fitting & Likelihood
@@ -185,16 +231,14 @@ module Constraints =
   let compute_expected_risk_in_interval
     (params': Parameters)
     (interval: Interval)
-    (x_dist: Map<float list, float>)
+    (x_dist: (Vector<float> * float) list)
     (base_model: Vector<float> -> float)
     (rng: Random) =
 
+    // Keep only X in the desired risk bin according to the base model.
     let relevant_x =
       x_dist
-      |> Map.toSeq
-      |> Seq.map (fun (k, v) -> Vector<float>.Build.Dense(List.toArray k), v)
-      |> Seq.filter (fun (xi, _) -> interval.contains(base_model xi))
-      |> Seq.toList
+      |> List.filter (fun (xi, _) -> interval.contains(base_model xi))
 
     match relevant_x with
     | [] -> 0.0
@@ -211,17 +255,22 @@ module Constraints =
       if total_weight = 0.0 then 0.0 else total_risk / total_weight
 
   let evaluate_constraints (params': Parameters) (calib: CalibrationTarget) (base_model) =
-    let rng = Random(42)
-    calib.intervals
-    |> List.indexed
-    |> List.sumBy (fun (i, interval) ->
-      let expected = compute_expected_risk_in_interval params' interval calib.x_distribution base_model rng
-      let target = calib.expected_risks.[i]
-      let tol = calib.tolerance
-      let upper_viol = Math.Max(0.0, expected - (1.0 + tol) * target)
-      let lower_viol = Math.Max(0.0, (1.0 - tol) * target - expected)
-      (upper_viol * upper_viol) + (lower_viol * lower_viol)
-    )
+    // If we don't have any target X distribution, there is nothing to calibrate against.
+    if List.isEmpty calib.x_distribution then
+      0.0
+    else
+      let rng = Random(42)
+      calib.intervals
+      |> List.indexed
+      |> List.sumBy (fun (i, interval) ->
+        let expected = compute_expected_risk_in_interval params' interval calib.x_distribution base_model rng
+        let target = calib.expected_risks.[i]
+        let tol = calib.tolerance
+        let upper_viol = Math.Max(0.0, expected - (1.0 + tol) * target)
+        let lower_viol = Math.Max(0.0, (1.0 - tol) * target - expected)
+        (upper_viol * upper_viol) + (lower_viol * lower_viol)
+      )
+
 
 // =============================================================================
 // OPTIMIZATION (Impure Shell)
@@ -272,7 +321,7 @@ module Optimization =
     // objective function (Vector -> float)
     let objective (v: Vector<float>) =
       try
-        let p = ParameterOps.from_vector v data.n_features_x initial.density
+        let p = ParameterOps.from_vector v data.n_features_x initial.density.tau_mean.Count
         let nll = -(Fitting.compute_log_likelihood p data)
         let penalty = Constraints.evaluate_constraints p calib base_model
         nll + (penalty * penalty_weight)
@@ -297,11 +346,12 @@ module Optimization =
       let minimizer = BfgsMinimizer(1e-5, 1e-5, 1e-5, 500)
       let result = minimizer.FindMinimum(obj_func, start_vec)
 
-      let final_params = ParameterOps.from_vector result.MinimizingPoint data.n_features_x initial.density
+      let final_params = ParameterOps.from_vector result.MinimizingPoint data.n_features_x initial.density.tau_mean.Count
       Ok final_params
 
     with ex ->
       Error (sprintf "Optimization failed: %s" ex.Message)
+
 
 // =============================================================================
 // API & WORKFLOW
@@ -326,30 +376,134 @@ let fit_constrained_model
 // =============================================================================
 
 let run_example () =
-  let n = 1000
-  let p = 4
+  // Synthetic example roughly mirroring the structure of the cML paper:
+  // 1. Simulate a large target population (X, Z, Y)
+  // 2. Build a base risk model using only X
+  // 3. Construct calibration targets from the target population
+  // 4. Fit a constrained model on a (possibly biased) source sample
+
   let rng = Random(42)
+  let n_target = 50000
+  let n_source = 2000
+  let p = 4
 
-  let x = Matrix<float>.Build.Random(n, p)
-  let z = Vector<float>.Build.Dense(n, fun _ -> Math.Exp(rng.NextDouble()))
-  let y = Vector<float>.Build.Dense(n, fun _ -> if rng.NextDouble() > 0.9 then 1.0 else 0.0)
+  // "True" parameters for data generation
+  let beta_0_true = -2.0
+  let beta_x_true = Vector<float>.Build.DenseOfArray [| 0.5; -0.3; 0.2; 0.1 |]
+  let beta_z_true = 1.0
 
-  let data = { x = x; z = z; y = y }
+  // log Z | X ~ N(tau_mean' * x_aug, sigma), truncated to log Z <= 0
+  let tau_true =
+    // intercept + 4 slopes
+    Vector<float>.Build.DenseOfArray [| 0.0; 0.2; -0.1; 0.1; 0.3 |]
+  let sigma_true = 0.4
 
+  // 1) Simulate target X
+  let x_target =
+    Matrix<float>.Build.Dense(n_target, p, (fun _ j ->
+      let u = rng.NextDouble()
+      if j % 2 = 0 then
+        // simple discrete covariate
+        if u < 0.3 then 0.0
+        elif u < 0.7 then 1.0
+        else 2.0
+      else
+        // simple continuous covariate
+        Normal.Sample(rng, 0.0, 1.0)
+    ))
+
+  let density_true = { tau_mean = tau_true; sigma = sigma_true }
+
+  // 2) Simulate Z | X using the truncated log-normal helper
+  let z_target =
+    x_target.EnumerateRows()
+    |> Seq.map (fun xi ->
+      let samples = MathHelpers.sample_truncated density_true xi 1 rng
+      samples.[0]
+    )
+    |> Vector<float>.Build.DenseOfEnumerable
+
+  // 3) Simulate Y | X, Z from a logistic model
+  let eta_target =
+    (x_target * beta_x_true)
+    + (z_target * beta_z_true)
+    + beta_0_true
+
+  let y_target =
+    eta_target.Map(fun e ->
+      let p_y = MathHelpers.sigmoid e
+      if rng.NextDouble() < p_y then 1.0 else 0.0
+    )
+
+  // Base risk model using only X (as in the paper: φ(X))
   let base_model (xi: Vector<float>) =
-    1.0 / (1.0 + Math.Exp(-xi.Sum() * 0.5))
+    let eta_base = beta_0_true + (beta_x_true * xi)
+    MathHelpers.sigmoid eta_base
+
+  // Compute base risks in the target population
+  let base_risks =
+    x_target.EnumerateRows()
+    |> Seq.map base_model
+    |> Seq.toArray
+
+  // Build calibration intervals based on quartiles of base risk
+  let sorted = Array.copy base_risks
+  Array.Sort(sorted)
+  let min_r = sorted.[0]
+  let max_r = sorted.[sorted.Length - 1]
+  let q1 = sorted.[sorted.Length / 4]
+  let q2 = sorted.[sorted.Length / 2]
+  let q3 = sorted.[3 * sorted.Length / 4]
+
+  let intervals = [
+    { lower = min_r - 1e-6; upper = q1 }
+    { lower = q1; upper = q2 }
+    { lower = q2; upper = q3 }
+    { lower = q3; upper = max_r + 1e-6 }
+  ]
+
+  // Expected base-model risk inside each interval (target Pe_r)
+  let expected_risks =
+    intervals
+    |> List.map (fun interval ->
+      let mutable s = 0.0
+      let mutable c = 0.0
+      for i in 0 .. n_target - 1 do
+        let r = base_risks.[i]
+        if interval.contains r then
+          s <- s + r
+          c <- c + 1.0
+      if c = 0.0 then 0.0 else s / c
+    )
+
+  // Empirical X distribution in the target population
+  let x_distribution =
+    [ for i in 0 .. n_target - 1 ->
+        let xi = x_target.Row(i)
+        (xi, 1.0) ]
 
   let target = {
-    intervals = [{ lower = 0.0; upper = 1.0 }]
-    expected_risks = [0.1]
+    intervals = intervals
+    expected_risks = expected_risks
     tolerance = 0.1
-    x_distribution = Map.empty
+    x_distribution = x_distribution
+  }
+
+  // Source sample: here we just take a subset of the target population.
+  // You could bias this (e.g., oversample high-risk individuals) to create
+  // a distributional shift between source and target.
+  let data = {
+    x = x_target.SubMatrix(0, n_source, 0, p)
+    z = z_target.SubVector(0, n_source)
+    y = y_target.SubVector(0, n_source)
   }
 
   match fit_constrained_model data target base_model with
   | Ok params' ->
-    printfn "Success! beta_z: %f" params'.beta_z
+    printfn "Constrained model fit succeeded."
+    printfn "Estimated beta_z: %f (true: %f)" params'.beta_z beta_z_true
+    printfn "Estimated sigma (density): %f (true: %f)" params'.density.sigma sigma_true
   | Error e ->
-    printfn "Failure: %s" e
+    printfn "Constrained model fit failed: %s" e
 
 run_example ()
