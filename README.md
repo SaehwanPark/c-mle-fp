@@ -28,6 +28,7 @@ This project implements a solution to that problem.
 ### What Goes Wrong Without cMLE?
 
 Standard maximum likelihood estimation assumes:
+
 $$
 P_S(X, Z, Y) \approx P(X, Z, Y)
 $$
@@ -63,6 +64,7 @@ Let:
 * $\pi_r$ = true average risk in interval$I_r$(from external data or base model)
 
 We impose, for each interval:
+
 $$
 (1 - \delta)\,\pi_r \le 
 \mathbb{E}\Big[g_\theta(X, Z) \mid \phi(X)\in I_r\Big]
@@ -109,6 +111,7 @@ This enables us to evaluate:
 $$
 \mathbb{E}_{Z \mid X} [ g_\theta(X, Z) ]
 $$
+
 numerically via Monte Carlo during constraint evaluation.
 
 ---
