@@ -130,24 +130,25 @@ module MathHelpers =
     let mu = density.tau_mean * x_aug
     let norm_dist = Normal(mu, density.sigma, rng)
 
-    let sample_one () =
-      let mutable attempts = 0
-      let mutable z = 1e-10
-      let mutable done_ = false
+    let clamp_z (z: float) =
+      z |> max 1e-10 |> min (1.0 - 1e-10)
 
-      while not done_ && attempts < 1000 do
+    let rec sample_one attempts =
+      if attempts >= 1000 then
+        // Fallback in degenerate cases; should be extremely rare.
+        1e-10
+      else
         let y = norm_dist.Sample()
         if y <= 0.0 then
-          let zz = Math.Exp y |> max 1e-10 |> min (1.0 - 1e-10)
-          z <- zz
-          done_ <- true
+          y
+          |> Math.Exp
+          |> clamp_z
         else
-          attempts <- attempts + 1
+          sample_one (attempts + 1)
 
-      z
-
-    Array.init n_samples (fun _ -> sample_one ())
+    Array.init n_samples (fun _ -> sample_one 0)
     |> Vector.Build.DenseOfArray
+
 
 // ============================================================================
 // Fitting: density + likelihood
