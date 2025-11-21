@@ -1,9 +1,4 @@
-﻿// ============================================================================
-// Constrained Maximum Likelihood Estimation (cMLE) for Risk Prediction
-// Based on: Cao et al. (2024) Lifetime Data Analysis
-// ============================================================================
-
-open System
+﻿open System
 open MathNet.Numerics.LinearAlgebra
 open MathNet.Numerics.Distributions
 open MathNet.Numerics.Optimization
@@ -13,7 +8,7 @@ open MathNet.Numerics.Optimization
 // ============================================================================
 
 let log_info (msg: string) =
-    printfn "[INFO] %s" msg
+  printfn "[INFO] %s" msg
 
 // ============================================================================
 // Result computation expression
@@ -51,7 +46,7 @@ type TrainingData = {
   member this.n_features_x = this.x.ColumnCount
 
 type ConditionalDensity = {
-  tau_mean: Vector<float>   // coefficients for log(Z) | X
+  tau_mean: Vector<float>
   sigma: float
 }
 
@@ -62,12 +57,8 @@ type Parameters = {
   density: ConditionalDensity
 }
 
-/// Holds the structure for the integration "noise"
-/// This allows us to use Common Random Numbers (CRN) for deterministic optimization
 type IntegrationContext = {
-  /// One vector of Uniform(0,1) noise per row in the target distribution
   noise_vectors: Vector<float> list
-  /// Number of samples per integration point
   n_integration_samples: int
 }
 
@@ -75,30 +66,30 @@ type CalibrationTarget = {
   intervals: Interval list
   expected_risks: float list
   tolerance: float
-  /// Empirical or tabulated distribution of X in the *target* population
-  /// Each element is (X, weight)
   x_distribution: (Vector<float> * float) list
 }
 
 // ============================================================================
-// Math helpers
+// Math helpers (Robust)
 // ============================================================================
 
 module MathHelpers =
 
   let sigmoid (eta: float) : float =
-    let clipped = Math.Max(-50.0, Math.Min(50.0, eta))
+    // Soft-clip to prevent NaN, but allow gradients to saturate naturally
+    let clipped = Math.Max(-100.0, Math.Min(100.0, eta))
     1.0 / (1.0 + Math.Exp(-clipped))
 
   /// Log-PDF of Truncated Log-Normal density
-  /// log Z ~ N(mu, sigma^2), truncated to (-inf, 0], so Z in (0, 1]
+  /// Robust implementation avoiding hard cliffs
   let log_pdf_truncated
     (density: ConditionalDensity)
     (z: float)
     (x: Vector<float>)
     : float =
 
-    let eps = 1e-10
+    // Clamp z slightly away from 0 and 1 to avoid Log(0)
+    let eps = 1e-12
     let z_clamped = z |> max eps |> min (1.0 - eps)
 
     let x_aug =
@@ -106,56 +97,55 @@ module MathHelpers =
       |> Vector.Build.DenseOfEnumerable
 
     let mu = density.tau_mean * x_aug
+    // Add a small stabilizer to sigma
+    let sigma = max 1e-5 density.sigma 
     let log_z = Math.Log z_clamped
     
-    // pdf(log Z) under N(mu, sigma)
-    let pdf_val = Normal.PDF(mu, density.sigma, log_z)
+    // 1. PDF of Normal at log_z
+    let pdf_val = Normal.PDF(mu, sigma, log_z)
     
-    // CDF at truncation point (log(1) = 0)
-    let cdf_upper = Normal.CDF(mu, density.sigma, 0.0)
+    // 2. CDF at truncation point (log(1) = 0)
+    let cdf_upper = Normal.CDF(mu, sigma, 0.0)
 
-    if cdf_upper <= 1e-15 || Double.IsNaN pdf_val then
-      -1e10
-    else
-      // log(pdf_trunc) = log(pdf_normal) - log(cdf_upper) - log(z) (jacobian)
-      Math.Log pdf_val - Math.Log cdf_upper - Math.Log z_clamped
+    // Robust log calculation: 
+    // Instead of returning -1e10, we clamp the values to a tiny number.
+    // This creates a steep slope rather than a cliff.
+    let safe_pdf = max 1e-100 pdf_val
+    let safe_cdf = max 1e-100 cdf_upper
 
-  /// Deterministic Inverse Transform Sampling for Truncated Log-Normal.
-  /// Used for integration during optimization to ensure smooth gradients.
-  /// u_noise: Pre-generated Uniform(0,1) scalars.
+    // Result: log(pdf) - log(cdf) - log(z) (Jacobian correction)
+    Math.Log safe_pdf - Math.Log safe_cdf - Math.Log z_clamped
+
+  /// Deterministic Inverse Transform Sampling
+  /// Maps pre-generated Uniform(0,1) noise to the truncated distribution
   let sample_truncated_deterministic
     (density: ConditionalDensity)
     (x: Vector<float>)
     (u_noise: Vector<float>) 
     : Vector<float> =
 
-    // 1. Calculate mu for this specific x
     let x_aug =
       seq { yield 1.0; yield! x }
       |> Vector.Build.DenseOfEnumerable
     
     let mu = density.tau_mean * x_aug
-    let sigma = density.sigma
+    let sigma = max 1e-5 density.sigma
 
-    // 2. Calculate the CDF value at the truncation point (log(1) = 0.0)
-    // This represents the total probability mass of the non-truncated part
+    // CDF value at truncation point 0.0
     let p_max = Normal.CDF(mu, sigma, 0.0)
 
-    // 3. Inverse Transform:
-    // Map u ~ [0,1] to p ~ [0, p_max]
-    // Then find the quantile corresponding to p
     u_noise.Map (fun u ->
+      // Scale u to the valid CDF range [0, p_max]
       let p_scaled = u * p_max
       
-      // Handle numerical edge cases where p is effectively 0
-      let p_safe = max p_scaled 1e-15
+      // Avoid p=0 exactly (InvCDF(-inf))
+      let p_safe = max p_scaled 1e-12
       
-      // Find y such that CDF(y) = p_safe
+      // Inverse CDF
       let log_z = Normal.InvCDF(mu, sigma, p_safe)
       
-      // Transform back to Z space: z = exp(log_z)
-      // Clamp to avoid 0.0 or 1.0 exactly
-      Math.Exp(log_z) |> max 1e-10 |> min (1.0 - 1e-10)
+      // Transform back
+      Math.Exp(log_z) |> max 1e-12 |> min (1.0 - 1e-12)
     )
 
 // ============================================================================
@@ -164,8 +154,6 @@ module MathHelpers =
 
 module ContextOps = 
   
-  /// Pre-calculates the random noise vectors for the target distribution integration.
-  /// This fixes the "randomness" for the duration of the optimization (CRN).
   let create_integration_context 
     (target_x: (Vector<float> * float) list) 
     (n_samples: int) 
@@ -176,15 +164,15 @@ module ContextOps =
     let noise = 
       target_x 
       |> List.map (fun _ -> 
-          // Generate Fixed Uniform Noise U(0,1)
-          let samples = Array.init n_samples (fun _ -> rng.NextDouble())
-          Vector.Build.DenseOfArray samples
+        // Generate Fixed Uniform Noise U(0,1)
+        let samples = Array.init n_samples (fun _ -> rng.NextDouble())
+        Vector.Build.DenseOfArray samples
       )
-        
+      
     { noise_vectors = noise; n_integration_samples = n_samples }
 
 // ============================================================================
-// Fitting: density + likelihood
+// Fitting
 // ============================================================================
 
 module Fitting =
@@ -194,15 +182,12 @@ module Fitting =
     (z: Vector<float>)
     : Result<ConditionalDensity, string> =
     try
-      // Guard against log(0)
       let z_safe = z.Map (fun zi -> max zi 1e-10)
       let log_z = z_safe.Map (fun v -> Math.Log v)
 
-      // Augment X with intercept
       let ones = Vector.Build.Dense(x.RowCount, 1.0)
       let x_aug = x.InsertColumn(0, ones)
 
-      // OLS for log Z | X
       let tau_mean = x_aug.Solve log_z
       let preds = x_aug * tau_mean
       let residuals = log_z - preds
@@ -225,35 +210,35 @@ module Fitting =
     MathHelpers.sigmoid eta
 
   let compute_log_likelihood (params': Parameters) (data: TrainingData) : float =
-    try
-      let eta = (data.x * params'.beta_x) + (data.z * params'.beta_z) + params'.beta_0
+    // No try-catch returning -1e10. Let NaNs propagate so optimization fails cleanly.
+    let eta = (data.x * params'.beta_x) + (data.z * params'.beta_z) + params'.beta_0
 
-      // Logistic contribution
-      let log_lik_logistic =
-        Seq.zip (data.y :> seq<float>) (eta :> seq<float>)
-        |> Seq.sumBy (fun (y, e) ->
-          let e_clipped = e |> max -50.0 |> min 50.0
-          // Stable computation: y*eta - log(1 + exp(eta))
-          y * e_clipped - Math.Log(1.0 + Math.Exp e_clipped)
-        )
+    // Logistic contribution
+    let log_lik_logistic =
+      Seq.zip (data.y :> seq<float>) (eta :> seq<float>)
+      |> Seq.sumBy (fun (y, e) ->
+        // Stable Log-Sigmoid
+        if e > 0.0 then
+          y * e - (e + Math.Log(1.0 + Math.Exp(-e)))
+        else
+          y * e - Math.Log(1.0 + Math.Exp(e))
+      )
 
-      // Density contribution
-      let density_contrib =
-        Seq.zip (data.x.EnumerateRows()) (data.z :> seq<float>)
-        |> Seq.sumBy (fun (xi, zi) ->
-          MathHelpers.log_pdf_truncated params'.density zi xi
-        )
+    // Density contribution
+    let density_contrib =
+      Seq.zip (data.x.EnumerateRows()) (data.z :> seq<float>)
+      |> Seq.sumBy (fun (xi, zi) ->
+        MathHelpers.log_pdf_truncated params'.density zi xi
+      )
 
-      log_lik_logistic + density_contrib
-    with _ -> -1e10
+    log_lik_logistic + density_contrib
 
 // ============================================================================
-// Constraints & Penalty Logic
+// Constraints
 // ============================================================================
 
 module Constraints =
 
-  /// Computes risk using the DETERMINISTIC sampler
   let compute_expected_risk_in_interval_deterministic
     (params': Parameters)
     (interval: Interval)
@@ -262,33 +247,31 @@ module Constraints =
     (base_model: Vector<float> -> float)
     : float =
 
-    // Zip the data with the pre-generated noise
     List.zip x_dist context.noise_vectors
     |> List.filter (fun ((x, _), _) -> interval.contains (base_model x))
     |> function
-      | [] -> 0.0
-      | items ->
-        items
-        |> List.map (fun ((xi, weight), u_vec) ->
-          // Deterministic sampling
-          let z_samples =
-            MathHelpers.sample_truncated_deterministic
-              params'.density xi u_vec
+       | [] -> 0.0
+       | items ->
+           items
+           |> List.map (fun ((xi, weight), u_vec) ->
+             // Deterministic sampling using Inverse Transform
+             let z_samples =
+               MathHelpers.sample_truncated_deterministic
+                 params'.density xi u_vec
 
-          let avg_risk =
-            z_samples.ToArray()
-            |> Array.averageBy (fun zi ->
-                Fitting.predict_risk params' xi zi
-              )
+             let avg_risk =
+               z_samples.ToArray()
+               |> Array.averageBy (fun zi ->
+                  Fitting.predict_risk params' xi zi
+               )
 
-          avg_risk * weight, weight
-        )
-        |> List.reduce (fun (r1, w1) (r2, w2) -> (r1 + r2, w1 + w2))
-        |> fun (total_risk, total_weight) ->
-          if total_weight = 0.0 then 0.0
-          else total_risk / total_weight
+             avg_risk * weight, weight
+           )
+           |> List.reduce (fun (r1, w1) (r2, w2) -> (r1 + r2, w1 + w2))
+           |> fun (total_risk, total_weight) ->
+             if total_weight = 0.0 then 0.0
+             else total_risk / total_weight
 
-  /// Returns: (sum_of_squared_violations, max_absolute_violation)
   let calculate_violations
     (params': Parameters)
     (calib: CalibrationTarget)
@@ -308,29 +291,28 @@ module Constraints =
         let tol = calib.tolerance
 
         // Constraint: target * (1-tol) <= expected <= target * (1+tol)
-        // Reference [cite: 99] (Eq 3 in paper)
         let upper_viol = max 0.0 (expected - (1.0 + tol) * target)
         let lower_viol = max 0.0 ((1.0 - tol) * target - expected)
 
-        // Squared penalty for the objective, max_abs for convergence check
         let sq_penalty = (upper_viol * upper_viol) + (lower_viol * lower_viol)
         let max_abs = max upper_viol lower_viol
         
         sq_penalty, max_abs
       )
-        
+      
     let total_sq_penalty = violations |> List.sumBy fst
     let max_violation = violations |> List.map snd |> List.max
     
     total_sq_penalty, max_violation
 
 // ============================================================================
-// Parameter vectorization
+// Parameter Ops
 // ============================================================================
 
 module ParameterOps =
 
   let to_vector (p: Parameters) : Vector<float> =
+    // Log transformation ensures sigma is strictly positive
     let log_sigma = Math.Log p.density.sigma
     seq {
       yield p.beta_0
@@ -357,8 +339,11 @@ module ParameterOps =
     let beta_x = v.SubVector(idx_beta_x, n_feat_x)
     let beta_z = v.[idx_beta_z]
     let tau_mean = v.SubVector(idx_tau, n_tau)
+    
     let log_sigma = v.[idx_log_sigma]
-    let sigma = log_sigma |> Math.Exp |> max 0.01
+    // Soft-constraint: sigma > 0 via Exp. 
+    // Adding epsilon prevents exact zero if parameters drift to -inf.
+    let sigma = Math.Exp(log_sigma) + 1e-6
 
     { beta_0 = beta_0; beta_x = beta_x; beta_z = beta_z;
       density = { tau_mean = tau_mean; sigma = sigma } }
@@ -373,7 +358,6 @@ module Optimization =
     { beta_0 = 0.0; beta_x = Vector.Build.Dense(data.n_features_x, 0.0);
       beta_z = 0.0; density = density }
 
-  // Central difference gradient
   let private numerical_gradient (f: float[] -> float) (x: float[]) : float[] =
     let n = x.Length
     let h = 1e-5
@@ -389,73 +373,79 @@ module Optimization =
     grad
 
   let optimize_with_scheduling
-      (data: TrainingData)
-      (calib: CalibrationTarget)
-      (base_model: Vector<float> -> float)
-      (initial: Parameters)
-      : Result<Parameters, string> =
+    (data: TrainingData)
+    (calib: CalibrationTarget)
+    (base_model: Vector<float> -> float)
+    (initial: Parameters)
+    : Result<Parameters, string> =
 
-      // 1. Freeze noise for deterministic integration (CRN)
-      // [cite: 139] (Paper implies integration over X and Z, we use MC for Z)
-      let context = ContextOps.create_integration_context calib.x_distribution 100 42
+    // Freeze noise for deterministic integration (CRN)
+    let context = ContextOps.create_integration_context calib.x_distribution 100 42
+    
+    // Schedule Settings
+    let max_penalty_weight = 1e6
+    let penalty_multiplier = 5.0 
+    let violation_tolerance = 1e-4 
+
+    let n_samples = float data.n_samples
+
+    let run_bfgs (start_params: Parameters) (rho: float) =
+      let objective (v: Vector<float>) : float =
+        let p = ParameterOps.from_vector v data.n_features_x initial.density.tau_mean.Count
+        
+        // 1. Compute NLL
+        let log_lik = Fitting.compute_log_likelihood p data
+        // Normalize NLL to be O(1)
+        let avg_nll = -(log_lik / n_samples)
+
+        // 2. Compute Penalty
+        let penalty_sq, _ = Constraints.calculate_violations p calib context base_model
+        
+        avg_nll + (rho * penalty_sq)
+
+      let start_vec = ParameterOps.to_vector start_params
       
-      // Penalty Schedule Settings
-      let max_penalty_weight = 1e6
-      let penalty_multiplier = 10.0
-      let violation_tolerance = 1e-4 // Convergence criteria
+      let gradient (v: Vector<float>) : Vector<float> =
+        let f_arr (arr: float[]) = arr |> Vector.Build.DenseOfArray |> objective
+        let grad_arr = numerical_gradient f_arr (v.ToArray())
+        Vector.Build.DenseOfArray grad_arr
 
-      // Inner Loop: BFGS with fixed rho
-      let run_bfgs (start_params: Parameters) (rho: float) =
-        let objective (v: Vector<float>) : float =
-          try
-            let p = ParameterOps.from_vector v data.n_features_x initial.density.tau_mean.Count
-            let nll = -Fitting.compute_log_likelihood p data
-            let penalty_sq, _ = Constraints.calculate_violations p calib context base_model
-            // [cite: 84, 85] Maximize Likelihood subject to constraints -> Minimize NLL + Penalty
-            nll + (rho * penalty_sq)
-          with _ -> Double.MaxValue
-
-        let start_vec = ParameterOps.to_vector start_params
-        
-        // Deterministic gradient allows BFGS to work
-        let gradient (v: Vector<float>) : Vector<float> =
-          let f_arr (arr: float[]) = arr |> Vector.Build.DenseOfArray |> objective
-          let grad_arr = numerical_gradient f_arr (v.ToArray())
-          Vector.Build.DenseOfArray grad_arr
-
-        let obj_func = ObjectiveFunction.Gradient(objective, gradient)
-        let minimizer = BfgsMinimizer(1e-5, 1e-5, 1e-5, 500)
+      let obj_func = ObjectiveFunction.Gradient(objective, gradient)
+      // Relaxed Gradient Tolerance (1e-4) prevents stalling on noise floor
+      let minimizer = BfgsMinimizer(1e-4, 1e-5, 1e-5, 1000)
+      
+      try 
         let res = minimizer.FindMinimum(obj_func, start_vec)
-        
         ParameterOps.from_vector res.MinimizingPoint data.n_features_x initial.density.tau_mean.Count
+      with _ ->
+        printfn "[WARN] BFGS Step Failed. Keeping parameters."
+        start_params
 
-      // Outer Loop: Penalty Scheduling
-      let rec schedule_loop (current_params: Parameters) (rho: float) (iteration: int) =
-        if rho > max_penalty_weight then
-          log_info "Max penalty weight reached. Returning best effort."
-          current_params
+    let rec schedule_loop (current_params: Parameters) (rho: float) (iteration: int) =
+      if rho > max_penalty_weight then
+        log_info "Max penalty weight reached."
+        current_params
+      else
+        log_info (sprintf "Schedule Iteration %d: rho = %.1f" iteration rho)
+        let next_params = run_bfgs current_params rho
+        
+        let _, max_viol = 
+          Constraints.calculate_violations next_params calib context base_model
+        
+        log_info (sprintf "  -> Max Constraint Violation: %.6f" max_viol)
+
+        if max_viol < violation_tolerance then
+          log_info "Constraints satisfied."
+          next_params
         else
-          log_info (sprintf "Schedule Iteration %d: rho = %.1f" iteration rho)
-          let next_params = run_bfgs current_params rho
-          
-          let _, max_viol = 
-            Constraints.calculate_violations next_params calib context base_model
-          
-          log_info (sprintf "  -> Max Constraint Violation: %.6f" max_viol)
+          schedule_loop next_params (rho * penalty_multiplier) (iteration + 1)
 
-          if max_viol < violation_tolerance then
-            log_info "Constraints satisfied within tolerance."
-            next_params
-          else
-            // Warm start next iteration
-            schedule_loop next_params (rho * penalty_multiplier) (iteration + 1)
-
-      try
-        // Start with a modest weight
-        let final_params = schedule_loop initial 1.0 1
-        Ok final_params
-      with ex ->
-        Error (sprintf "Optimization failed: %s" ex.Message)
+    try
+      // Start with rho=0.1 to gently guide parameters
+      let final_params = schedule_loop initial 0.1 1
+      Ok final_params
+    with ex ->
+      Error (sprintf "Optimization failed: %s" ex.Message)
 
 // ============================================================================
 // Public API
@@ -468,21 +458,16 @@ let fit_constrained_model
   : Result<Parameters, string> =
 
   result {
-    // 1. Fit Z | X density (initial guess) [cite: 80]
     let! density = Fitting.fit_conditional_density data.x data.z
-
-    // 2. Initialize parameters
     let initial = Optimization.initialize_parameters data density
-
-    // 3. Optimize with penalty scheduling [cite: 114] (Approximating KKT solution)
     let! final_params = 
-        Optimization.optimize_with_scheduling data calib base_model initial
+      Optimization.optimize_with_scheduling data calib base_model initial
 
     return final_params
   }
 
 // ============================================================================
-// Simulation (for verification)
+// Simulation
 // ============================================================================
 
 let simulate_target_population (n_target: int) (p: int) (rng: Random) 
@@ -494,7 +479,6 @@ let simulate_target_population (n_target: int) (p: int) (rng: Random)
   let tau_true = Vector.Build.DenseOfArray [| 0.0; 0.2; -0.1; 0.1; 0.3 |]
   let density_true = { tau_mean = tau_true; sigma = 0.4 }
 
-  // X generation
   let x_target =
     Matrix.Build.Dense(n_target, p, (fun _ j ->
       let u = rng.NextDouble()
@@ -502,20 +486,16 @@ let simulate_target_population (n_target: int) (p: int) (rng: Random)
       else Normal.Sample(rng, 0.0, 1.0)
     ))
 
-  // Z generation using clean sampling (not deterministic context here, this is ground truth)
-  // Using a simpler sampling for data gen than the constrained one
   let z_target =
     x_target.EnumerateRows()
     |> Seq.map (fun xi ->
       let x_aug = seq {1.0; yield! xi} |> Vector.Build.DenseOfEnumerable
       let mu = tau_true * x_aug
       let raw = Normal.Sample(rng, mu, 0.4)
-      // Truncation simulation (naive rejection for ground truth generation is fine)
-      if raw > 0.0 then Math.Exp(0.0) else Math.Exp(raw) // simplified
+      if raw > 0.0 then Math.Exp(0.0) else Math.Exp(raw)
     )
     |> Vector.Build.DenseOfEnumerable
 
-  // Y generation
   let eta = (x_target * beta_x_true) + (z_target * beta_z_true) + beta_0_true
   let y_target =
     eta.Map (fun e ->
@@ -533,7 +513,6 @@ let build_calibration_target (x: Matrix<float>) (base_model: Vector<float>->floa
   Array.Sort sorted
   let n = sorted.Length
   
-  // Define quartiles as intervals [cite: 90]
   let intervals = [
     { lower = -1.0; upper = sorted.[n/4] }
     { lower = sorted.[n/4]; upper = sorted.[n/2] }
@@ -541,7 +520,6 @@ let build_calibration_target (x: Matrix<float>) (base_model: Vector<float>->floa
     { lower = sorted.[3*n/4]; upper = 2.0 }
   ]
   
-  // P_r^e (Expected risk in target population) [cite: 95]
   let expected_risks =
     intervals |> List.map (fun iv ->
       let in_bin = base_risks |> Array.filter iv.contains
@@ -558,21 +536,19 @@ let run_example () =
   let n_target, n_source, p = 1000, 500, 4
   
   let x_t, z_t, y_t = simulate_target_population n_target p rng
-  // Base model (mimicking BCRAT) [cite: 69]
   let base_model = build_base_model -2.0 (Vector.Build.DenseOfArray [|0.5;-0.3;0.2;0.1|])
   let calib = build_calibration_target x_t base_model
   
-  // Source data (subset)
   let source_data = { 
-      x = x_t.SubMatrix(0, n_source, 0, p); 
-      z = z_t.SubVector(0, n_source); 
-      y = y_t.SubVector(0, n_source) 
+    x = x_t.SubMatrix(0, n_source, 0, p); 
+    z = z_t.SubVector(0, n_source); 
+    y = y_t.SubVector(0, n_source) 
   }
 
   match fit_constrained_model source_data calib base_model with
   | Ok res -> 
-      printfn "Success! Beta_Z: %.4f (True ~1.0)" res.beta_z
-      printfn "Density Sigma: %.4f" res.density.sigma
+    printfn "Success! Beta_Z: %.4f (True ~1.0)" res.beta_z
+    printfn "Density Sigma: %.4f" res.density.sigma
   | Error e -> printfn "Error: %s" e
 
-// run_example()
+run_example()
