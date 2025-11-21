@@ -19,9 +19,9 @@ In applied risk modeling—especially in healthcare and population sciences—we
 
 Concretely:
 
-* You already have a **base model**$\phi(X) = P(Y=1 \mid X)$that is well-calibrated in a target population$P$.
-* You collect new data from a **non-representative source population**$P_S$that includes an additional predictor$Z$.
-* If you fit a standard logistic regression on$(X, Z)$using this biased sample, your resulting model will often be **miscalibrated** in the target population—especially in the tails.
+* You already have a **base model** $\phi(X) = P(Y=1 \mid X)$ that is well-calibrated in a target population$P$.
+* You collect new data from a **non-representative source population**$P_S$that includes an additional predictor $Z$.
+* If you fit a standard logistic regression on $(X, Z)$ using this biased sample, your resulting model will often be **miscalibrated** in the target population—especially in the tails.
 
 This project implements a solution to that problem.
 
@@ -52,7 +52,7 @@ $$
 g_\theta(X, Z) = P(Y = 1 \mid X, Z)
 $$
 
-But we enforce that its predictions agree with the base model$\phi(X)$**on average** across risk strata in the target population.
+But we enforce that its predictions agree with the base model $\phi(X)$ **on average** across risk strata in the target population.
 
 ### Calibration Constraints
 
@@ -162,8 +162,8 @@ This project emphasizes **clarity, correctness, and structure**, not just numeri
 
 * Uses `MathNet.Numerics.Optimization.BfgsMinimizer`
 * All parameters are optimized jointly:
-  * Logistic coefficients$\beta$
-  * Density parameters$\tau$and$\sigma$(via log-scale parameterization)
+  * Logistic coefficients $\beta$
+  * Density parameters $\tau$ and $\sigma$ (via log-scale parameterization)
 * Gradients are computed via central finite differences.
 
 ---
