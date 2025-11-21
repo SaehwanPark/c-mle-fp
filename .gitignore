@@ -56,3 +56,4 @@ Thumbs.db
 
 # Jupyter Notebook checkpoints (if using .NET Interactive notebooks)
 .ipynb_checkpoints/
+.fake
