@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
@@ -7,7 +7,9 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Include="cmle_vectorized.fs" />
     <Compile Include="cmle.fs" />
+    <Compile Include="main.fs" />
   </ItemGroup>
 
   <ItemGroup>
