@@ -31,7 +31,7 @@ When testing across different hardware architectures, the original implementatio
 |----------|--------------|----| -------|-------|---------------|
 | **AMD 6800H** | x86-64 | WSL2/Fedora | 0.9778 | 2.2% | 0.000000 |
 | **AMD 7940HS** | x86-64 | Ubuntu 25.04 | 0.9778 | 2.2% | 0.000000 |
-| **M1 Max** | ARM64 | macOS | 0.6198 | **38%** | 0.000034 |
+| **M1 Max** | ARM64 | macOS Tahoe 26.1 | 0.6198 | **38%** | 0.000034 |
 
 **Critical pattern**: The discrepancy is **architecture-based**, not OS-based.
 - All x86-64 systems produce identical results (regardless of OS or virtualization)
@@ -546,7 +546,7 @@ The final implementation is:
 - CPU: Apple M1 Max (10C: 8P+2E)
 - Architecture: ARM64 (Apple Silicon)
 - RAM: 64 GB unified LPDDR5
-- OS: macOS Sequoia 15.1.1
+- OS: macOS Tahoe 26.1
 - Bandwidth: 400 GB/s unified memory
 - .NET Runtime: CoreCLR 9.0 (arm64)
 
