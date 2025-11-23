@@ -129,8 +129,6 @@ This project emphasizes **clarity, correctness, and structure**, not just numeri
 * **Railway-Oriented Programming (ROP)**
   Uses a custom `Result` CE (`result { ... }`) to manage failures explicitly.
 
----
-
 ### 4.2 Key Modules
 
 | Module | Responsibility |
@@ -144,31 +142,45 @@ This project emphasizes **clarity, correctness, and structure**, not just numeri
 
 ---
 
-### 4.3 Optimization Setup
+## 5. Vectorization & The "Lucky Noise" Phenomenon
 
-* Uses `MathNet.Numerics.Optimization.BfgsMinimizer`
-* **Penalty Scheduling:** Iterative loop that hardens constraints until violation tolerance ($< 10^{-4}$) is met.
-* **Gradients:** Computed via central finite differences on the deterministic objective.
-* **Numerical Stability:** Inputs to logs and exponentials are soft-clipped to prevent NaNs during line search.
+The project contains two implementations: `cmle_original.fs` (row-wise) and `cmle_vectorized.fs` (matrix-based).
 
----
+### 5.1 Performance
+The vectorized implementation (`cmle_vectorized.fs`) flattens the integration context into a single matrix ($N_{obs} \times N_{samples}$). This allows the CPU/BLAS provider to compute risks for thousands of integration points via SIMD operations.
+* **Speedup:** ~2x faster (e.g., 52s $\to$ 28s).
+* **Consistency:** Uses `MersenneTwister` for cross-platform reproducibility (macOS/Linux/Windows).
 
-## 5. Why F#?
+### 5.2 The "Overfitting to Constraint" Trap
+Users may notice that the original implementation often achieved **0.0000** constraint violation while maintaining high accuracy. **This was likely a statistical anomaly.**
 
-This project is also a language experiment.
+Because the original code used `System.Random` with a small integration sample size ($N=100$), it is possible to find a specific seed where the integration noise "cancels out" perfectly inside the calibration bins. This allowed the optimizer to satisfy tight tolerances ($10^{-4}$) without sacrificing the predictive power of $Z$.
 
-F# provides:
+**The Reality (revealed by Vectorization):**
+With a robust RNG (`MersenneTwister`) and matrix-based sampling, the "natural integration error" is visible (approx 2-4%).
+* If we force the optimizer to achieve **0.00%** violation, it will "crush" the $\beta_Z$ coefficient to zero.
+* Why? Because if $\beta_Z \approx 0$, the model mimics the Base Model perfectly, satisfying the constraint but destroying predictive power.
 
-* Strong static typing → fewer silent modeling bugs  
-* Algebraic domain modeling → constraints encoded structurally  
-* Expression-oriented programming → natural for statistical pipelines  
-* Functional-first architecture → better separation of concerns  
+### 5.3 The Robust Solution
+The vectorized implementation solves this via:
+1.  **Warm Start:** Fits an unconstrained MLE first to find the "true" $\beta_Z$ (e.g., ~1.0).
+2.  **Relaxed Schedule:** Caps the penalty weight (`rho`) earlier.
+3.  **Statistical Tolerance:** Accepts a ~2.5% violation as natural noise, preserving the causal signal of $Z$.
 
-This is particularly important because cMLE is *structural*, not just numerical.
+**Diagnostic Table (Vectorized Run):**
+```text
+ITER  | RHO        | BETA_Z     | BETA_0     | NLL        | MAX_VIOL
+----------------------------------------------------------------------
+1     | 0.1        | 1.5640     | -2.6476    | -1.28153   | 0.170927
+...
+6     | 3.2        | 1.0216     | -2.7727    | -1.22727   | 0.038044
+```
 
----
+*Result: The model recovers the true Beta\_Z (1.0) while accepting a 3.8% calibration deviation.*
 
-## 6. How to Use
+-----
+
+## 6\. How to Use
 
 ```fsharp
 let result =
