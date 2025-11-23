@@ -5,14 +5,14 @@ open MathNet.Numerics
 open MathNet.Numerics.LinearAlgebra
 open MathNet.Numerics.Distributions
 open MathNet.Numerics.Optimization
-open MathNet.Numerics.Random // Added for MersenneTwister
+open MathNet.Numerics.Random 
+open MathNet.Numerics.Statistics // <--- ADDED THIS for Correlation
 
 // ============================================================================
 // Configuration & Logging
 // ============================================================================
 
 // Optional: Uncomment to force managed provider if hardware differences 
-// (AVX on Linux vs NEON on Mac) cause slight floating point drift.
 // Control.UseManaged() 
 
 let log_info (msg: string) =
@@ -66,8 +66,6 @@ type Parameters = {
 }
 
 type IntegrationContext = {
-  // CHANGED: Flattened noise into a Matrix for vectorization.
-  // Rows = Observations, Cols = Integration Samples
   noise_matrix: Matrix<float>
   n_integration_samples: int
 }
@@ -76,8 +74,6 @@ type CalibrationTarget = {
   intervals: Interval list
   expected_risks: float list
   tolerance: float
-  // We keep the raw matrix rows for index lookup, but pre-calculating
-  // the matrix form in the context is preferred for speed.
   x_matrix: Matrix<float> 
   weights: Vector<float>
 }
@@ -118,29 +114,30 @@ module MathHelpers =
 
     Math.Log safe_pdf - Math.Log safe_cdf - Math.Log z_clamped
 
-  /// NEW: Vectorized Deterministic Inverse Transform Sampling
-  /// Maps pre-generated Uniform(0,1) noise matrix to the truncated distribution
-  /// Returns: Matrix (N_obs x N_samples)
+  /// Vectorized Deterministic Inverse Transform Sampling
   let sample_truncated_matrix
     (density: ConditionalDensity)
     (x_aug: Matrix<float>)       
     (u_noise: Matrix<float>)     
     : Matrix<float> =
 
+    // 1. Calculate Mean for every observation (Vector N)
     let mu_vec = x_aug * density.tau_mean
     let sigma = max 1e-5 density.sigma
 
-    // Ensure we map strictly: Row i of Noise uses Row i of Mu
-    u_noise.MapIndexed (fun i _ u ->
-      let mu = mu_vec.[i] // Strict row alignment
-      let p_max = Normal.CDF(mu, sigma, 0.0)
-      let p_scaled = u * p_max
-      let p_safe = max p_scaled 1e-12
-      let log_z = Normal.InvCDF(mu, sigma, p_safe)
-      Math.Exp(log_z) |> max 1e-12 |> min (1.0 - 1e-12)
+    // 2. Use Build.Dense to guarantee coordinate (i, j) maps to mu_vec[i]
+    // This is safer than MapIndexed when broadcasting and guarantees alignment
+    Matrix.Build.Dense(u_noise.RowCount, u_noise.ColumnCount, fun i j ->
+        let u = u_noise.[i, j]
+        let mu = mu_vec.[i] // Explicitly grab row i
+        
+        let p_max = Normal.CDF(mu, sigma, 0.0)
+        let p_scaled = u * p_max
+        let p_safe = max p_scaled 1e-12
+        
+        let log_z = Normal.InvCDF(mu, sigma, p_safe)
+        Math.Exp(log_z) |> max 1e-12 |> min (1.0 - 1e-12)
     )
-
-
 
 // ============================================================================
 // Context Management
@@ -154,12 +151,8 @@ module ContextOps =
     (seed: int) 
     : IntegrationContext =
     
-    // CHANGED: Use MersenneTwister for cross-platform consistency
     let rng = MersenneTwister(seed)
-    
     let n_rows = x_matrix.RowCount
-
-    // CHANGED: Generate one large dense matrix of noise
     let noise = Matrix.Build.Dense(n_rows, n_samples, (fun _ _ -> rng.NextDouble()))
       
     { noise_matrix = noise; n_integration_samples = n_samples }
@@ -228,12 +221,11 @@ module Fitting =
 
 module Constraints =
 
-  /// NEW: Fully vectorized violation calculation
   let calculate_violations
     (params': Parameters)
     (calib: CalibrationTarget)
     (context: IntegrationContext)
-    (base_model_scores: Vector<float>) // Optimization: Pass pre-calculated base scores
+    (base_model_scores: Vector<float>) 
     : float * float =
     
     // 1. Prepare X_aug for density sampling
@@ -241,46 +233,41 @@ module Constraints =
     let x_aug = calib.x_matrix.InsertColumn(0, ones)
 
     // 2. Vectorized Sampling of Z (N x Samples)
-    // This replaces the row-by-row loop
     let z_samples_mat = 
         MathHelpers.sample_truncated_matrix params'.density x_aug context.noise_matrix
 
     // 3. Calculate Risk Matrix (N x Samples)
-    // Pre-calculate the linear part of X: beta_0 + X * beta_x
-    let x_logits = (calib.x_matrix * params'.beta_x) + params'.beta_0
+    // Pre-calculate linear part: beta_0 + X * beta_x
+    // Use Map to safely broadcast scalar beta_0
+    let x_logits = (calib.x_matrix * params'.beta_x).Map(fun v -> v + params'.beta_0)
 
-    // CRITICAL FIX: 
-    // We use a double loop or specific Column-wise operation to ensure safety.
-    // MapIndexed is row-major in MathNet, but let's be explicit.
+    // CRITICAL FIX: Explicitly build matrix using coordinates to prevent misalignment
     let risk_mat = Matrix.Build.Dense(z_samples_mat.RowCount, z_samples_mat.ColumnCount, (fun r c ->
       let z = z_samples_mat.[r, c]
       // Explicitly grab the logit for row 'r'
-      let x_part = x_logits.[r] 
-      let eta = x_part + (params'.beta_z * z)
+      let eta = x_logits.[r] + (params'.beta_z * z)
       MathHelpers.sigmoid eta
     ))
     
-    // 4. Average across integration samples (Row-wise mean) to get E[Risk|X]
-    // Result is Vector of length N
+    // 4. Average across integration samples
     let expected_risk_per_obs = 
         risk_mat.RowSums() / float context.n_integration_samples
 
     // 5. Calculate Violations per Interval
+    // Convert to list once for efficient filtering
+    let indices_source = base_model_scores |> Seq.toList |> List.indexed
+
     let violations = 
       calib.intervals
       |> List.indexed
       |> List.map (fun (i, interval) ->
         
-        // Filter indices based on base_model_scores
-        // (This is still iterative but fast compared to integration)
         let indices = 
-             base_model_scores 
-             |> Seq.toList
-             |> List.indexed 
+             indices_source
              |> List.filter (fun (_, score) -> interval.contains score)
              |> List.map fst
 
-        // Weighted Average of Expected Risks for this interval
+        // Weighted Average
         let (total_risk, total_weight) =
             indices 
             |> List.fold (fun (acc_r, acc_w) idx -> 
@@ -374,6 +361,37 @@ module Optimization =
       x.[i] <- original
     grad
 
+  // Helper to minimize a specific objective function
+  let private minimize_objective 
+    (initial_params: Parameters)
+    (data: TrainingData)
+    (objective_fn: Parameters -> float) 
+    : Parameters =
+    
+    let n_tau = initial_params.density.tau_mean.Count
+    
+    let obj_wrapper (v: Vector<float>) : float =
+        let p = ParameterOps.from_vector v data.n_features_x n_tau
+        objective_fn p
+
+    let start_vec = ParameterOps.to_vector initial_params
+    
+    let gradient (v: Vector<float>) : Vector<float> =
+        let f_arr (arr: float[]) = arr |> Vector.Build.DenseOfArray |> obj_wrapper
+        let grad_arr = numerical_gradient f_arr (v.ToArray())
+        Vector.Build.DenseOfArray grad_arr
+
+    let obj_func = ObjectiveFunction.Gradient(obj_wrapper, gradient)
+    // Tighter tolerance
+    let minimizer = BfgsMinimizer(1e-5, 1e-5, 1e-5, 1000)
+    
+    try 
+        let res = minimizer.FindMinimum(obj_func, start_vec)
+        ParameterOps.from_vector res.MinimizingPoint data.n_features_x n_tau
+    with _ ->
+        printfn "[WARN] Optimization Step Failed. Keeping parameters."
+        initial_params
+
   let optimize_with_scheduling
     (data: TrainingData)
     (calib: CalibrationTarget)
@@ -381,63 +399,63 @@ module Optimization =
     (initial: Parameters)
     : Result<Parameters, string> =
 
-    // Freeze noise for deterministic integration (CRN)
-    // CHANGED: Use the Matrix-based context creator
+    // 1. WARM START (Unconstrained MLE)
+    log_info "Running Warm Start (Unconstrained MLE)..."
+    let warm_start_objective (p: Parameters) =
+        let log_lik = Fitting.compute_log_likelihood p data
+        -(log_lik / float data.n_samples)
+
+    let warm_params = minimize_objective initial data warm_start_objective
+    log_info (sprintf "Warm Start Complete. Beta_Z: %.4f | Beta_0: %.4f" warm_params.beta_z warm_params.beta_0)
+
+    // 2. PREPARE CONSTRAINED RUN
     let context = ContextOps.create_integration_context calib.x_matrix 100 42
     
-    // Pre-calculate base model scores once to avoid re-computing in loop
     let base_scores = 
         calib.x_matrix.EnumerateRows() 
         |> Seq.map base_model 
         |> Vector.Build.DenseOfEnumerable
 
-    let max_penalty_weight = 1e6
-    let penalty_multiplier = 5.0 
-    let violation_tolerance = 1e-4 
+    // Cap the rho earlier
+    // After reaching ~10-50, the trade off is usually optimal
+    let max_penalty_weight = 50.0
+    // Use the gentler schedule we decided on
+    let penalty_multiplier = 2.0 
 
+    // Relax the tolerance
+    // 0.05 (5%) may be goof for N around 1k
+    let violation_tolerance = 0.05 
     let n_samples = float data.n_samples
 
-    let run_bfgs (start_params: Parameters) (rho: float) =
-      let objective (v: Vector<float>) : float =
-        let p = ParameterOps.from_vector v data.n_features_x initial.density.tau_mean.Count
-        
-        let log_lik = Fitting.compute_log_likelihood p data
-        let avg_nll = -(log_lik / n_samples)
-
-        // CHANGED: Call vectorized violations
-        let penalty_sq, _ = Constraints.calculate_violations p calib context base_scores
-        
-        avg_nll + (rho * penalty_sq)
-
-      let start_vec = ParameterOps.to_vector start_params
-      
-      let gradient (v: Vector<float>) : Vector<float> =
-        let f_arr (arr: float[]) = arr |> Vector.Build.DenseOfArray |> objective
-        let grad_arr = numerical_gradient f_arr (v.ToArray())
-        Vector.Build.DenseOfArray grad_arr
-
-      let obj_func = ObjectiveFunction.Gradient(objective, gradient)
-      let minimizer = BfgsMinimizer(1e-4, 1e-5, 1e-5, 1000)
-      
-      try 
-        let res = minimizer.FindMinimum(obj_func, start_vec)
-        ParameterOps.from_vector res.MinimizingPoint data.n_features_x initial.density.tau_mean.Count
-      with _ ->
-        printfn "[WARN] BFGS Step Failed. Keeping parameters."
-        start_params
+    // Print Table Header
+    printfn "\n%-5s | %-10s | %-10s | %-10s | %-10s | %-10s" "ITER" "RHO" "BETA_Z" "BETA_0" "NLL" "MAX_VIOL"
+    printfn "%s" (String.replicate 70 "-")
 
     let rec schedule_loop (current_params: Parameters) (rho: float) (iteration: int) =
       if rho > max_penalty_weight then
         log_info "Max penalty weight reached."
         current_params
       else
-        log_info (sprintf "Schedule Iteration %d: rho = %.1f" iteration rho)
-        let next_params = run_bfgs current_params rho
+        // Define objective with current rho
+        let constrained_objective (p: Parameters) =
+             let log_lik = Fitting.compute_log_likelihood p data
+             let avg_nll = -(log_lik / n_samples)
+             let penalty_sq, _ = Constraints.calculate_violations p calib context base_scores
+             avg_nll + (rho * penalty_sq)
+
+        // Run Optimization Step
+        let next_params = minimize_objective current_params data constrained_objective
         
-        let _, max_viol = 
-          Constraints.calculate_violations next_params calib context base_scores
+        // --- DETAILED DIAGNOSTICS ---
+        // Re-calculate metrics for display
+        let log_lik = Fitting.compute_log_likelihood next_params data
+        let current_nll = -(log_lik / n_samples)
+        let _, max_viol = Constraints.calculate_violations next_params calib context base_scores
         
-        log_info (sprintf "  -> Max Constraint Violation: %.6f" max_viol)
+        // Log row in table format
+        printfn "%-5d | %-10.1f | %-10.4f | %-10.4f | %-10.5f | %-10.6f" 
+            iteration rho next_params.beta_z next_params.beta_0 current_nll max_viol
+        // ----------------------------
 
         if max_viol < violation_tolerance then
           log_info "Constraints satisfied."
@@ -446,7 +464,7 @@ module Optimization =
           schedule_loop next_params (rho * penalty_multiplier) (iteration + 1)
 
     try
-      let final_params = schedule_loop initial 0.1 1
+      let final_params = schedule_loop warm_params 0.1 1
       Ok final_params
     with ex ->
       Error (sprintf "Optimization failed: %s" ex.Message)
@@ -477,7 +495,6 @@ let fit_constrained_model
 let simulate_target_population (n_target: int) (p: int) (seed: int) 
   : Matrix<float> * Vector<float> * Vector<float> =
 
-  // CHANGED: Use MersenneTwister for cross-platform consistency
   let rng = MersenneTwister(seed)
 
   let beta_0_true = -2.0
@@ -532,7 +549,6 @@ let build_calibration_target (x: Matrix<float>) (base_model: Vector<float>->floa
       if in_bin.Length = 0 then 0.0 else Array.average in_bin
     )
 
-  // CHANGED: Setup matrix and weights in target for vectorization
   let weights = Vector.Build.Dense(x.RowCount, 1.0)
   
   { intervals = intervals;
@@ -544,7 +560,6 @@ let build_calibration_target (x: Matrix<float>) (base_model: Vector<float>->floa
 let run_example () =
   let n_target, n_source, p = 1000, 500, 4
   
-  // Pass seed explicitly
   let x_t, z_t, y_t = simulate_target_population n_target p 42
   let base_model = build_base_model -2.0 (Vector.Build.DenseOfArray [|0.5;-0.3;0.2;0.1|])
   let calib = build_calibration_target x_t base_model
