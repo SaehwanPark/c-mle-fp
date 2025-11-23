@@ -8,8 +8,8 @@
 
   <ItemGroup>
     <Compile Include="cmle_vectorized.fs" />
-    <Compile Include="cmle.fs" />
-    <Compile Include="main.fs" />
+    <Compile Include="cmle_original.fs" />
+    <Compile Include="run_examples.fs" />
   </ItemGroup>
 
   <ItemGroup>
