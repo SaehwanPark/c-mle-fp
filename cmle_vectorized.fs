@@ -123,34 +123,24 @@ module MathHelpers =
   /// Returns: Matrix (N_obs x N_samples)
   let sample_truncated_matrix
     (density: ConditionalDensity)
-    (x_aug: Matrix<float>)       // Matrix: N x (Features + 1)
-    (u_noise: Matrix<float>)     // Matrix: N x Samples
+    (x_aug: Matrix<float>)       
+    (u_noise: Matrix<float>)     
     : Matrix<float> =
 
-    // 1. Calculate Mean for every observation (Vectorized)
-    // mu_vec[i] corresponds to row i
     let mu_vec = x_aug * density.tau_mean
     let sigma = max 1e-5 density.sigma
 
-    // 2. Map the noise matrix to Z values
-    // MathNet's MapIndexed is efficient enough here.
-    // We process every cell (i, j) where i is observation, j is sample index
+    // Ensure we map strictly: Row i of Noise uses Row i of Mu
     u_noise.MapIndexed (fun i _ u ->
-        let mu = mu_vec.[i]
-        
-        // CDF value at truncation point 0.0
-        let p_max = Normal.CDF(mu, sigma, 0.0)
-        
-        // Scale u to the valid CDF range [0, p_max]
-        let p_scaled = u * p_max
-        let p_safe = max p_scaled 1e-12
-        
-        // Inverse CDF
-        let log_z = Normal.InvCDF(mu, sigma, p_safe)
-        
-        // Transform back
-        Math.Exp(log_z) |> max 1e-12 |> min (1.0 - 1e-12)
+      let mu = mu_vec.[i] // Strict row alignment
+      let p_max = Normal.CDF(mu, sigma, 0.0)
+      let p_scaled = u * p_max
+      let p_safe = max p_scaled 1e-12
+      let log_z = Normal.InvCDF(mu, sigma, p_safe)
+      Math.Exp(log_z) |> max 1e-12 |> min (1.0 - 1e-12)
     )
+
+
 
 // ============================================================================
 // Context Management
@@ -259,13 +249,16 @@ module Constraints =
     // Pre-calculate the linear part of X: beta_0 + X * beta_x
     let x_logits = (calib.x_matrix * params'.beta_x) + params'.beta_0
 
-    // We iterate the matrix to apply the sigmoid.
-    // Note: (x_logits.[i] + beta_z * z) is the eta
-    let risk_mat = 
-        z_samples_mat.MapIndexed(fun i _ z ->
-            let eta = x_logits.[i] + (params'.beta_z * z)
-            MathHelpers.sigmoid eta
-        )
+    // CRITICAL FIX: 
+    // We use a double loop or specific Column-wise operation to ensure safety.
+    // MapIndexed is row-major in MathNet, but let's be explicit.
+    let risk_mat = Matrix.Build.Dense(z_samples_mat.RowCount, z_samples_mat.ColumnCount, (fun r c ->
+      let z = z_samples_mat.[r, c]
+      // Explicitly grab the logit for row 'r'
+      let x_part = x_logits.[r] 
+      let eta = x_part + (params'.beta_z * z)
+      MathHelpers.sigmoid eta
+    ))
     
     // 4. Average across integration samples (Row-wise mean) to get E[Risk|X]
     // Result is Vector of length N
