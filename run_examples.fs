@@ -1,7 +1,7 @@
 open System.Diagnostics
 
 printfn "==="
-printfn "Original version (cmle.fs)\n==="
+printfn "Original version (cmle_original.fs)\n==="
 let stopwatch = Stopwatch.StartNew()
 CMLE.Original.run_example()
 stopwatch.Stop()
