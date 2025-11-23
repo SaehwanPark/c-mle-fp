@@ -402,8 +402,8 @@ module Optimization =
     // 1. WARM START (Unconstrained MLE)
     log_info "Running Warm Start (Unconstrained MLE)..."
     let warm_start_objective (p: Parameters) =
-        let log_lik = Fitting.compute_log_likelihood p data
-        -(log_lik / float data.n_samples)
+      let log_lik = Fitting.compute_log_likelihood p data
+      -(log_lik / float data.n_samples)
 
     let warm_params = minimize_objective initial data warm_start_objective
     log_info (sprintf "Warm Start Complete. Beta_Z: %.4f | Beta_0: %.4f" warm_params.beta_z warm_params.beta_0)
@@ -412,9 +412,9 @@ module Optimization =
     let context = ContextOps.create_integration_context calib.x_matrix 100 42
     
     let base_scores = 
-        calib.x_matrix.EnumerateRows() 
-        |> Seq.map base_model 
-        |> Vector.Build.DenseOfEnumerable
+      calib.x_matrix.EnumerateRows() 
+      |> Seq.map base_model 
+      |> Vector.Build.DenseOfEnumerable
 
     // Cap the rho earlier
     // After reaching ~10-50, the trade off is usually optimal
@@ -423,7 +423,7 @@ module Optimization =
     let penalty_multiplier = 2.0 
 
     // Relax the tolerance
-    // 0.05 (5%) may be goof for N around 1k
+    // 0.05 (5%) may be good for N around 1k
     let violation_tolerance = 0.05 
     let n_samples = float data.n_samples
 
@@ -438,10 +438,10 @@ module Optimization =
       else
         // Define objective with current rho
         let constrained_objective (p: Parameters) =
-             let log_lik = Fitting.compute_log_likelihood p data
-             let avg_nll = -(log_lik / n_samples)
-             let penalty_sq, _ = Constraints.calculate_violations p calib context base_scores
-             avg_nll + (rho * penalty_sq)
+            let log_lik = Fitting.compute_log_likelihood p data
+            let avg_nll = -(log_lik / n_samples)
+            let penalty_sq, _ = Constraints.calculate_violations p calib context base_scores
+            avg_nll + (rho * penalty_sq)
 
         // Run Optimization Step
         let next_params = minimize_objective current_params data constrained_objective
