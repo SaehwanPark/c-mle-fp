@@ -373,7 +373,7 @@ The final implementation is:
 **M1 Max System** (Mac Studio):
 - CPU: Apple M1 Max (10C: 8P+2E)
 - RAM: 64 GB unified LPDDR5
-- OS: macOS Sequoia 15.1.1
+- OS: macOS Tahoe 25.1
 - Bandwidth: 400 GB/s unified memory
 
 ---
