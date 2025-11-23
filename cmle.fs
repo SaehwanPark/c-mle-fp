@@ -1,4 +1,6 @@
-﻿open System
+﻿module CMLE.Original
+
+open System
 open MathNet.Numerics.LinearAlgebra
 open MathNet.Numerics.Distributions
 open MathNet.Numerics.Optimization
@@ -550,5 +552,3 @@ let run_example () =
     printfn "Success! Beta_Z: %.4f (True ~1.0)" res.beta_z
     printfn "Density Sigma: %.4f" res.density.sigma
   | Error e -> printfn "Error: %s" e
-
-run_example()
