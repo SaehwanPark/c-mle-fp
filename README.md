@@ -7,6 +7,10 @@ This project implements and extends the method proposed in:
 > **Cao, Y., Ma, W., Zhao, G., McCarthy, A. M., & Chen, J. (2024).** > *A constrained maximum likelihood approach to developing well-calibrated models for predicting binary outcomes.* > Lifetime Data Analysis, 30, 624–648.  
 > https://doi.org/10.1007/s10985-024-09628-9
 
+Relevant articles:
+- [My First F# Project: Implementing Constrained Optimization from Scratch](https://debugndiscover.netlify.app/posts/first_fsharp_project_cmle/)
+- [Working Toward Robustness (F# c-MLE Project Part 2)](https://debugndiscover.netlify.app/posts/working-toward-robustness/)
+
 ---
 
 ## 1. Motivation: The Problem cMLE Solves
